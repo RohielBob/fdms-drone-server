@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.db
+*.xlsx
+firebase_key.json
+.env
