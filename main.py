@@ -492,102 +492,185 @@ def reset_data():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    return """
+    html_content = """
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-<meta charset="UTF-8">
-<title>FDMS Dashboard PRO</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FDMS Dashboard Pro - Groupe 6</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap" rel="stylesheet">
 
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
-
-<style>
-body { background:#0f172a; color:white; font-family:Arial; }
-.card { background:#1e293b; border-radius:16px; padding:20px; }
-</style>
+    <style>
+        body { background: #f8fafc; font-family: 'Inter', sans-serif; }
+        .glass-card { 
+            background: white; 
+            border-radius: 16px; 
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+        }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
 </head>
+<body class="flex h-screen p-6 gap-6">
 
-<body class="p-6">
+    <aside class="w-72 glass-card p-6 flex flex-col shrink-0">
+        <div class="flex items-center gap-3 mb-10 px-2">
+            <div class="bg-blue-600 w-10 h-10 rounded-xl flex items-center justify-center text-white">
+                <i class="fas fa-plane"></i>
+            </div>
+            <h1 class="text-xl font-black text-slate-800">FDMS <span class="text-blue-600">PRO</span></h1>
+        </div>
 
-<h1 class="text-3xl font-bold mb-6">🚁 FDMS Dashboard PRO</h1>
+        <nav class="flex-1 space-y-2">
+            <a href="/" class="flex items-center gap-4 text-slate-500 hover:bg-slate-50 p-4 rounded-xl transition-all font-semibold">
+                <i class="fas fa-home w-5"></i> Accueil
+            </a>
+            <div class="flex items-center gap-4 bg-blue-600 text-white p-4 rounded-xl font-bold shadow-lg shadow-blue-200">
+                <i class="fas fa-chart-pie w-5"></i> Dashboard
+            </div>
+            <a href="/latest-data" target="_blank" class="flex items-center gap-4 text-slate-500 hover:bg-slate-50 p-4 rounded-xl transition-all font-semibold">
+                <i class="fas fa-bolt w-5 text-amber-500"></i> Flux JSON
+            </a>
+            <div class="pt-4 mt-4 border-t border-slate-100 space-y-2">
+                <a href="/download_csv" class="flex items-center gap-4 text-emerald-600 hover:bg-emerald-50 p-4 rounded-xl transition-all font-bold border border-emerald-100">
+                    <i class="fas fa-file-csv"></i> Export Données
+                </a>
+                
+                <button onclick="confirmDelete()" class="w-full flex items-center gap-4 text-red-600 hover:bg-red-50 p-4 rounded-xl transition-all font-bold border border-red-100">
+                    <i class="fas fa-trash-alt"></i> Supprimer Data
+                </button>
+            </div>
+        </nav>
+    </aside>
 
-<div class="grid grid-cols-4 gap-4 mb-6">
-<div class="card">Altitude<br><b id="alt">--</b></div>
-<div class="card">Vitesse<br><b id="vit">--</b></div>
-<div class="card">Batterie<br><b id="bat">--</b></div>
-<div class="card">Température<br><b id="temp">--</b></div>
-</div>
+    <main class="flex-1 flex flex-col gap-6 overflow-y-auto">
+        
+        <div class="grid grid-cols-4 gap-4">
+            <div class="glass-card p-4">
+                <p class="text-xs font-bold text-slate-400 uppercase">Altitude</p>
+                <div class="text-2xl font-black text-slate-800"><span id="card-alt">--</span> <small class="text-slate-400 text-sm">m</small></div>
+            </div>
+            <div class="glass-card p-4">
+                <p class="text-xs font-bold text-slate-400 uppercase">Vitesse</p>
+                <div class="text-2xl font-black text-slate-800"><span id="card-vit">--</span> <small class="text-slate-400 text-sm">m/s</small></div>
+            </div>
+            <div class="glass-card p-4">
+                <p class="text-xs font-bold text-slate-400 uppercase">Batterie</p>
+                <div class="text-2xl font-black text-slate-800"><span id="card-batt">--</span> <small class="text-slate-400 text-sm">%</small></div>
+            </div>
+            <div class="glass-card p-4">
+                <p class="text-xs font-bold text-slate-400 uppercase">Température</p>
+                <div class="text-2xl font-black text-slate-800"><span id="card-temp">--</span> <small class="text-slate-400 text-sm">°C</small></div>
+            </div>
+        </div>
 
-<div id="charts"></div>
+        <div id="charts-container" class="space-y-6">
+            </div>
+    </main>
 
-<script>
+    <script>
+        const commonOptions = (colors, title) => ({
+            chart: { 
+                type: 'line', 
+                height: 300, 
+                toolbar: { show: false }, 
+                animations: { enabled: false },
+                background: '#fff'
+            },
+            colors: Array.isArray(colors) ? colors : [colors],
+            stroke: { width: 3, curve: 'smooth' },
+            grid: { 
+                borderColor: '#f1f5f9', 
+                xaxis: { lines: { show: true } }, 
+                yaxis: { lines: { show: true } } 
+            },
+            xaxis: { 
+                type: 'datetime',
+                labels: { 
+                    datetimeUTC: false,
+                    format: 'HH:mm:ss',
+                    style: { colors: '#64748b', fontSize: '10px' } 
+                },
+                title: { text: 'Timestamp (Date & Heure)', style: { color: '#94a3b8' } },
+                axisBorder: { show: false }
+            },
+            yaxis: { 
+                labels: { style: { colors: '#64748b' } },
+                title: { text: title, style: { color: '#94a3b8' } }
+            },
+            tooltip: { x: { format: 'dd MMM yyyy HH:mm:ss' } }
+        });
 
-const charts = {};
-const config = [
- {id:"altitude", color:"#3b82f6"},
- {id:"vitesse", color:"#f43f5e"},
- {id:"batterie", color:"#10b981"},
- {id:"temperature", color:"#f59e0b"},
- {id:"pression", color:"#6366f1"},
- {id:"yaw", color:"#94a3b8"},
-];
+        const chartConfigs = [
+            { id: 'altitude', color: '#3b82f6', label: 'Altitude (m)', multi: false },
+            { id: 'vitesse', color: '#f43f5e', label: 'Vitesse (m/s)', multi: false },
+            { id: 'pression', color: '#6366f1', label: 'Pression (hPa)', multi: false },
+            { id: 'temperature', color: '#f59e0b', label: 'Température (°C)', multi: false },
+            { id: 'batterie', color: '#10b981', label: 'Batterie (%)', multi: false },
+            { id: 'accel', color: ['#3b82f6', '#f43f5e', '#10b981'], label: 'Accélération (AX, AY, AZ)', multi: true, keys: ['ax', 'ay', 'az'] },
+            { id: 'attitude', color: ['#8b5cf6', '#ec4899'], label: 'Attitude (Roll, Pitch)', multi: true, keys: ['roll', 'pitch'] },
+            { id: 'yaw', color: '#475569', label: 'Yaw (Cap °)', multi: false }
+        ];
 
-const container = document.getElementById("charts");
+        const charts = {};
+        const container = document.getElementById('charts-container');
 
-config.forEach(c=>{
- let div = document.createElement("div");
- div.className="card mb-4";
- div.innerHTML=`<h3>${c.id}</h3><div id="chart-${c.id}"></div>`;
- container.appendChild(div);
+        chartConfigs.forEach(conf => {
+            const div = document.createElement('div');
+            div.className = "glass-card p-6";
+            div.innerHTML = `<h3 class="text-sm font-bold text-slate-700 mb-4 uppercase flex items-center gap-2">
+                <span class="w-1 h-4 rounded" style="background:${Array.isArray(conf.color) ? conf.color[0] : conf.color}"></span> ${conf.label}
+            </h3><div id="chart-${conf.id}"></div>`;
+            container.appendChild(div);
+            charts[conf.id] = new ApexCharts(document.querySelector(`#chart-${conf.id}`), commonOptions(conf.color, conf.label));
+            charts[conf.id].render();
+        });
 
- charts[c.id] = new ApexCharts(
-  document.querySelector("#chart-"+c.id),
-  {
-    chart:{type:"line",height:250,animations:{enabled:false}},
-    series:[{name:c.id,data:[]}],
-    xaxis:{type:"datetime"},
-    colors:[c.color]
-  }
- );
+        async function refresh() {
+            try {
+                const response = await fetch('/graph-data');
+                const data = await response.json();
+                if (!data.length) return;
 
- charts[c.id].render();
-});
+                const last = data[data.length - 1];
+                document.getElementById('card-alt').innerText = last.altitude;
+                document.getElementById('card-vit').innerText = last.vitesse;
+                document.getElementById('card-batt').innerText = last.batterie;
+                document.getElementById('card-temp').innerText = last.temperature;
 
-async function update(){
+                const mapData = (key) => data.map(d => ({ x: new Date(d.timestamp).getTime(), y: d[key] }));
 
- let res = await fetch("/graph-data");
- let data = await res.json();
+                chartConfigs.forEach(conf => {
+                    if (conf.multi) {
+                        const series = conf.keys.map(k => ({ name: k.toUpperCase(), data: mapData(k) }));
+                        charts[conf.id].updateSeries(series, false);
+                    } else {
+                        charts[conf.id].updateSeries([{ name: conf.id, data: mapData(conf.id) }], false);
+                    }
+                });
+            } catch (e) { console.error(e); }
+        }
 
- if(!data.length) return;
+        async function confirmDelete() {
+            if (confirm("⚠️ Êtes-vous sûr de vouloir supprimer TOUTES les données ?")) {
+                try {
+                    const res = await fetch('/delete-all', { method: 'DELETE' });
+                    if (res.ok) {
+                        alert("Données supprimées.");
+                        window.location.reload();
+                    }
+                } catch (e) { alert("Erreur."); }
+            }
+        }
 
- let last = data[data.length-1];
-
- document.getElementById("alt").innerText = last.altitude;
- document.getElementById("vit").innerText = last.vitesse;
- document.getElementById("bat").innerText = last.batterie;
- document.getElementById("temp").innerText = last.temperature;
-
- const mapData = (key)=>data.map(d=>({
-   x: d.timestamp * 1000, // ✅ FIX ICI
-   y: d[key]
- }));
-
- config.forEach(c=>{
-   charts[c.id].updateSeries([{
-     name:c.id,
-     data: mapData(c.id)
-   }]);
- });
-
-}
-
-setInterval(update,500); // ⚡ ultra fluide
-update();
-
-</script>
-
+        setInterval(refresh, 800);
+    </script>
 </body>
 </html>
-"""
+    """
     return HTMLResponse(content=html_content)
