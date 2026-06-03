@@ -1,18 +1,26 @@
 import os
+import shutil
 import sqlite3
 import threading
 from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI
+from fastapi import UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from openpyxl import Workbook, load_workbook
-
+from fastapi import WebSocket, WebSocketDisconnect
+from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 
 import firebase_admin
 from firebase_admin import credentials, db
+
+import asyncio
+import json
+
+counter = 0
 
 # =====================================================
 # CONFIG
@@ -28,6 +36,43 @@ app = FastAPI(
     description="API de surveillance et d’analyse des données de vol du drone du Groupe 6",
     version="1.0.0"
 )
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections = []
+        self.lock = asyncio.Lock()
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        async with self.lock:
+            self.active_connections.append(websocket)
+
+    async def disconnect(self, websocket: WebSocket):
+        async with self.lock:
+            if websocket in self.active_connections:
+                self.active_connections.remove(websocket)
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        try:
+            await websocket.send_text(message)
+        except:
+            await self.disconnect(websocket)
+
+    async def broadcast(self, data: dict):
+        message = json.dumps(data)
+        dead = []
+
+        async with self.lock:
+            for connection in self.active_connections:
+                try:
+                    await connection.send_text(message)
+                except:
+                    dead.append(connection)
+
+            for d in dead:
+                if d in self.active_connections:
+                    self.active_connections.remove(d)
+
+manager = ConnectionManager()
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,65 +83,93 @@ app.add_middleware(
 )
 
 excel_lock = threading.Lock()
+db_lock = threading.Lock()
 
 # =====================================================
 # FIREBASE
 # =====================================================
+# =====================================================
+# FIREBASE (VERSION PRO SAFE)
+# =====================================================
 FIREBASE_DB_URL = "https://drone-fdm-project-groupe-6-default-rtdb.firebaseio.com/"
 firebase_enabled = False
 
-if os.path.exists(FIREBASE_CREDENTIALS):
+def init_firebase():
+    global firebase_enabled
+
+    if not os.path.exists(FIREBASE_CREDENTIALS):
+        print("❌ firebase_key.json introuvable")
+        firebase_enabled = False
+        return
+
     try:
         if not firebase_admin._apps:
             cred = credentials.Certificate(FIREBASE_CREDENTIALS)
             firebase_admin.initialize_app(cred, {
                 "databaseURL": FIREBASE_DB_URL
             })
+
+        # 🔥 TEST RÉEL
+        ref = db.reference("health_check")
+        ref.set({
+            "status": "ok",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+
         firebase_enabled = True
+        print("✅ Firebase connecté")
+
     except Exception as e:
-        print("Erreur Firebase :", e)
+        print("🚨 Firebase erreur:", e)
         firebase_enabled = False
-else:
-    print("firebase_key.json introuvable")
+
+
+# 👉 IMPORTANT : lancement au démarrage
+init_firebase()
+
+def check_firebase():
+    if not firebase_enabled:
+        return "désactivé"
+
+    try:
+        ref = db.reference("health_check")
+        data = ref.get()
+
+        if data:
+            return "actif"
+        else:
+            return "instable"
+
+    except:
+        return "erreur"
 
 # =====================================================
 # MODELE (FIX 422 ICI)
 # =====================================================
 class DroneData(BaseModel):
-    Flight_ID: Optional[str] = "MISSION"
+    Flight_ID: str = "MISSION"
     Date: Optional[str] = None
-    timestamp: int
-
+    timestamp: Optional[int]
     altitude: float
     vitesse: float
-
     ax: float
     ay: float
     az: float
-
     roll: float
     pitch: float
     yaw: float
-
     pression: float
     temperature: float
+    batterie: float = 100.0
 
-    batterie: Optional[float] = 100.0
+    @validator("timestamp", pre=True, always=True)
+    def validate_ts(cls, v):
+        return validate_timestamp(v)
 
 
 # =====================================================
 # EXCEL INIT
 # =====================================================
-if not os.path.exists(EXCEL_FILE):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Données Drone"
-    ws.append([
-        "Flight_ID","Date","timestamp","altitude","vitesse",
-        "ax","ay","az","roll","pitch","yaw",
-        "pression","temperature","batterie"
-    ])
-    wb.save(EXCEL_FILE)
 
 # =====================================================
 # SQLITE INIT (FIX IMPORTANT)
@@ -132,9 +205,74 @@ init_db()
 
 
 def get_db_connection():
-    conn = sqlite3.connect(SQLITE_DB)
+    conn = sqlite3.connect(SQLITE_DB, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+def validate_timestamp(ts):
+    try:
+        # 🔥 None ou vide
+        if ts is None:
+            return int(datetime.utcnow().timestamp())
+
+        # 🔥 string → int
+        if isinstance(ts, str):
+            ts = int(float(ts))
+
+        # 🔥 float → int
+        if isinstance(ts, float):
+            ts = int(ts)
+
+        # 🔥 valeur négative ou absurde
+        if ts < 0:
+            return int(datetime.utcnow().timestamp())
+
+        return ts
+
+    except:
+        # fallback sécurité
+        return int(datetime.utcnow().timestamp())
+
+# =====================================================
+# EXCEL (VERSION PRO SAFE)
+# =====================================================
+
+EXCEL_HEADERS = [
+    "Flight_ID","Date","timestamp","altitude","vitesse",
+    "ax","ay","az","roll","pitch","yaw",
+    "pression","temperature","batterie"
+]
+
+def init_excel():
+    if not os.path.exists(EXCEL_FILE):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Données Drone"
+        ws.append(EXCEL_HEADERS)
+        wb.save(EXCEL_FILE)
+        print("✅ Excel créé")
+
+init_excel()
+
+def append_to_excel(data_dict):
+    temp_file = EXCEL_FILE + ".tmp"
+
+    try:
+        with excel_lock:
+            wb = load_workbook(EXCEL_FILE)
+            ws = wb.active
+
+            row = [data_dict.get(h) for h in EXCEL_HEADERS]
+            ws.append(row)
+
+            wb.save(temp_file)
+            wb.close()
+
+            # 🔥 remplace fichier seulement si OK
+            shutil.move(temp_file, EXCEL_FILE)
+
+    except Exception as e:
+        print("🚨 Excel safe write error:", e)
 
 
 # =====================================================
@@ -305,7 +443,7 @@ def home():
         async function resetData() {
             if(confirm("Êtes-vous sûr de vouloir supprimer TOUTES les données ?")) {
                 try {
-                    const response = await fetch('/reset-data', { method: 'DELETE' });
+                    const response = await fetch('/delete-all', { method: 'DELETE' });
                     if(response.ok) {
                         alert("Données réinitialisées avec succès !");
                         location.reload();
@@ -324,67 +462,46 @@ def home():
 # POST DRONE DATA (MISSION PLANNER SAFE)
 # =====================================================
 @app.post("/drone-data")
-def receive_drone_data(data: DroneData):
+async def receive_drone_data(data: DroneData):
 
     data_dict = data.dict()
+    # 🔥 VALIDATION TIMESTAMP
+    data_dict["timestamp"] = validate_timestamp(data_dict.get("timestamp"))
 
-    # sécurité batterie (évite crash)
     if data_dict.get("batterie") is None:
         data_dict["batterie"] = 100.0
 
     alerts = generate_alerts(data_dict)
 
     # =========================
-    # SQLITE
+    # SQLITE (VERSION PROPRE)
     # =========================
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
 
-    # === DANS TON CODE SERVEUR ===
-    # === VERSION CORRIGÉE DU INSERT ===
-    cursor.execute("""
-        INSERT INTO drone_data (
-            Flight_ID, Date, timestamp, altitude, vitesse,
-            ax, ay, az, roll, pitch, yaw,
-            pression, temperature, batterie
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data.Flight_ID, data.Date, data.timestamp, data.altitude, data.vitesse,
-        data.ax, data.ay, data.az, data.roll, data.pitch, data.yaw,
-        data.pression, data.temperature, data.batterie
-    ))
+            cursor.execute("""
+                INSERT INTO drone_data (
+                    Flight_ID, Date, timestamp, altitude, vitesse,
+                    ax, ay, az, roll, pitch, yaw,
+                    pression, temperature, batterie
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                data.Flight_ID, data.Date, data_dict["timestamp"], data.altitude, data.vitesse,
+                data.ax, data.ay, data.az, data.roll, data.pitch, data.yaw,
+                data.pression, data.temperature, data.batterie
+            ))
 
-    conn.commit()
-    conn.close()
+            conn.commit()
+
+        finally:
+            conn.close()
 
     # =========================
     # EXCEL
     # =========================
-    try:
-        with excel_lock:
-            wb = load_workbook(EXCEL_FILE)
-            ws = wb.active
-
-            ws.append([
-                data.Flight_ID,
-                data.Date,
-                data.timestamp,
-                data.altitude,
-                data.vitesse,
-                data.ax,
-                data.ay,
-                data.az,
-                data.roll,
-                data.pitch,
-                data.yaw,
-                data.pression,
-                data.temperature,
-                data.batterie
-            ])
-
-            wb.save(EXCEL_FILE)
-    except:
-        pass
+    append_to_excel(data_dict)
 
     # =========================
     # FIREBASE
@@ -392,8 +509,13 @@ def receive_drone_data(data: DroneData):
     if firebase_enabled:
         try:
             db.reference("drone_data").push(data_dict)
-        except:
-            pass
+        except Exception as e:
+            print("Firebase error:", e)
+
+    # =========================
+    # WEBSOCKET (TEMPS RÉEL)
+    # =========================
+    asyncio.create_task(manager.broadcast(data_dict))
 
     return {
         "status": "ok",
@@ -422,6 +544,20 @@ def latest_data():
     return data
 
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+
+    try:
+        while True:
+            await websocket.receive_text()
+
+    except WebSocketDisconnect:
+        await manager.disconnect(websocket)
+
+    except Exception:
+        await manager.disconnect(websocket)
+
 # =====================================================
 # GRAPH DATA
 # =====================================================
@@ -430,7 +566,6 @@ def graph_data():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 🔥 On limite aux 100 dernières données
     cursor.execute("""
         SELECT * FROM drone_data
         ORDER BY id DESC
@@ -442,16 +577,12 @@ def graph_data():
 
     data = []
 
-    for row in reversed(rows):  # pour remettre dans l'ordre chronologique
+    for row in reversed(rows):
         d = dict(row)
 
-        # ✅ Sécurisation timestamp
-        if d.get("timestamp") is not None:
-            d["timestamp"] = int(d["timestamp"])
-        else:
-            d["timestamp"] = 0
+        d["timestamp"] = validate_timestamp(d.get("timestamp"))
 
-        # ✅ Nettoyage valeurs nulles
+        # nettoyage
         for key in d:
             if d[key] is None:
                 d[key] = 0
@@ -460,6 +591,43 @@ def graph_data():
 
     return data
 
+# =====================================================
+# IMPORT EXCEL (SIMULATION MODE)
+# =====================================================
+@app.post("/upload-excel")
+async def upload_excel(file: UploadFile = File(...)):
+    if not file.filename.endswith(".xlsx"):
+        return {"error": "Format invalide, fichier .xlsx requis"}
+
+    try:
+        wb = load_workbook(file.file, data_only=True)
+        ws = wb.active
+
+        rows = list(ws.iter_rows(values_only=True))
+
+        if len(rows) < 2:
+            return {"error": "Fichier vide ou invalide"}
+
+        headers = rows[0]
+        data = []
+
+        for row in rows[1:]:
+            d = dict(zip(headers, row))
+
+            for key in d:
+                if d[key] is None:
+                    d[key] = 0
+
+            d["timestamp"] = validate_timestamp(d.get("timestamp"))
+            data.append(d)
+
+        return {
+            "status": "ok",
+            "data": data
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/health-json")
 def health():
@@ -481,13 +649,13 @@ def health():
             last_row = cursor.fetchone()
 
             if last_row:
-                last_timestamp = last_row[0]
+                last_timestamp = int(last_row[0]) if last_row else None
 
             conn.close()
 
         return {
             "status": "ok",
-            "firebase": "actif" if firebase_enabled else "désactivé",
+            "firebase": check_firebase(),
             "excel": "présent" if excel_exists else "absent",
             "sqlite": "présent" if sqlite_exists else "absent",
             "nombre_donnees": total_data,
@@ -537,8 +705,16 @@ body {
 <div class="w-full max-w-5xl space-y-6">
 
     <h1 class="text-3xl font-black text-center text-slate-700">
-        💓 FDMS Health Monitor
-    </h1>
+    💓 FDMS Health Monitor
+    <span id="liveDot" style="
+        display:inline-block;
+        width:10px;
+        height:10px;
+        border-radius:50%;
+        background:red;
+        margin-left:10px;
+    "></span>
+</h1>
 
     <!-- ALERT BAR -->
     <div id="alertBox" class="hidden p-4 rounded-xl font-bold text-center"></div>
@@ -552,10 +728,19 @@ body {
     </div>
 
     <!-- DATA -->
-    <div class="grid grid-cols-3 gap-4">
+        <div class="grid grid-cols-5 gap-4">
         <div class="card text-center">Données<br><b id="count"></b></div>
         <div class="card text-center">Dernière réception<br><b id="last"></b></div>
         <div class="card text-center">Mode<br><b id="mode"></b></div>
+        <div class="card text-center">
+            Ping<br>
+            <b id="ping">--</b> ms
+        </div>
+
+        <div class="card text-center">
+            Uptime<br>
+            <b id="uptime">--</b>
+            </div>
     </div>
 
 </div>
@@ -563,87 +748,129 @@ body {
 <script>
 
 let lastCount = 0;
+let startTime = Date.now();
+let errorHistory = [];
 
+// ==========================
+// 🔴 LIVE DOT
+// ==========================
+function setLive(status) {
+    const dot = document.getElementById("liveDot");
+
+    if (!dot) return;
+
+    if (status === "ok") {
+        dot.style.background = "#10b981";
+        dot.style.boxShadow = "0 0 10px #10b981";
+    } else if (status === "warn") {
+        dot.style.background = "#f59e0b";
+        dot.style.boxShadow = "0 0 10px #f59e0b";
+    } else {
+        dot.style.background = "#ef4444";
+        dot.style.boxShadow = "0 0 10px #ef4444";
+    }
+}
+
+// ==========================
+// 🚨 ALERT SYSTEM
+// ==========================
 function showAlert(message, type="bad") {
     const box = document.getElementById("alertBox");
     box.classList.remove("hidden");
 
-    box.className = "p-4 rounded-xl font-bold text-center " +
-        (type === "bad" ? "bg-red-100 text-red-600" :
-         type === "warn" ? "bg-yellow-100 text-yellow-600" :
-         "bg-green-100 text-green-600");
+    box.className =
+        "p-4 rounded-xl font-bold text-center " +
+        (type === "bad"
+            ? "bg-red-100 text-red-600"
+            : type === "warn"
+            ? "bg-yellow-100 text-yellow-600"
+            : "bg-green-100 text-green-600");
 
     box.innerText = message;
+
+    errorHistory.push({
+        time: new Date().toLocaleTimeString(),
+        message
+    });
+
+    if (errorHistory.length > 5) errorHistory.shift();
 }
 
-async function refresh() {
+// ==========================
+// ⚡ FETCH HEALTH
+// ==========================
+async function fetchHealth() {
+    const start = performance.now();
+
     try {
-        const res = await fetch("/health-json");
+        const res = await fetch("/health-json", { cache: "no-store" });
         const data = await res.json();
 
-        // STATUS
-        document.getElementById("server").innerHTML =
-            data.status === "ok"
-            ? "<span class='ok'>OK</span>"
-            : "<span class='bad'>ERROR</span>";
+        const ping = Math.round(performance.now() - start);
 
-        document.getElementById("firebase").innerHTML =
-            data.firebase === "actif"
-            ? "<span class='ok'>ACTIF</span>"
-            : "<span class='bad'>OFF</span>";
-
-        document.getElementById("sqlite").innerHTML =
-            data.sqlite === "présent"
-            ? "<span class='ok'>OK</span>"
-            : "<span class='bad'>ABSENT</span>";
-
-        document.getElementById("excel").innerHTML =
-            data.excel === "présent"
-            ? "<span class='ok'>OK</span>"
-            : "<span class='bad'>ABSENT</span>";
-
-        // DATA
+        // UI UPDATE
+        document.getElementById("server").innerText = data.status;
+        document.getElementById("firebase").innerText = data.firebase;
+        document.getElementById("sqlite").innerText = data.sqlite;
+        document.getElementById("excel").innerText = data.excel;
         document.getElementById("count").innerText = data.nombre_donnees;
         document.getElementById("mode").innerText = data.mode_stockage;
 
-        if (data.derniere_reception !== "aucune donnée") {
-            let d = new Date(data.derniere_reception * 1000);
-            document.getElementById("last").innerText = d.toLocaleTimeString();
+        document.getElementById("ping").innerText = ping;
+
+        // UPTIME
+        const uptimeMs = Date.now() - startTime;
+        document.getElementById("uptime").innerText =
+            Math.floor(uptimeMs / 60000) + " min";
+
+        // LAST DATA
+        if (data.derniere_reception && data.derniere_reception !== "aucune donnée") {
+            const d = new Date(data.derniere_reception * 1000);
+            document.getElementById("last").innerText = d.toLocaleString();
         } else {
             document.getElementById("last").innerText = "Aucune";
         }
 
-        // 🚨 ALERTES VISUELLES
+        // LOGIC STATUS
+        let status = "ok";
 
-        // Firebase DOWN
+        if (ping > 800) status = "warn";
+
         if (data.firebase !== "actif") {
-            showAlert("🚨 Firebase est désactivé !", "bad");
+            showAlert("🚨 Firebase OFFLINE", "bad");
+            status = "bad";
         }
-
-        // SQLite ou Excel absent
         else if (data.sqlite !== "présent" || data.excel !== "présent") {
-            showAlert("⚠️ Problème stockage détecté", "warn");
+            showAlert("⚠️ Stockage instable", "warn");
+            status = "warn";
         }
-
-        // 🧠 Détection anomalies (pas de nouvelles données)
         else if (lastCount !== 0 && data.nombre_donnees === lastCount) {
-            showAlert("⚠️ Aucune nouvelle donnée reçue", "warn");
+            showAlert("⚠️ Drone inactif", "warn");
+            status = "warn";
         }
-
-        // OK
         else {
             showAlert("✅ Système opérationnel", "ok");
         }
 
+        setLive(status);
+
         lastCount = data.nombre_donnees;
 
     } catch (e) {
-        showAlert("🚨 Serveur inaccessible", "bad");
+        setLive("bad");
+        showAlert("🚨 SERVEUR DOWN", "bad");
     }
 }
+// ==========================
+// 📌 INPUT FILE BUTTON
+// ==========================
 
-setInterval(refresh, 1000);
-refresh();
+
+// LOOP
+window.onload = () => {
+    fetchHealth();
+    setInterval(fetchHealth, 3000);
+};
 
 </script>
 
@@ -704,6 +931,11 @@ def dashboard():
         }
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    #dropZone.dragover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    color: #3b82f6;
+    }
     </style>
 </head>
 <body class="flex h-screen p-6 gap-6">
@@ -726,8 +958,14 @@ def dashboard():
             <a href="/latest-data" target="_blank" class="flex items-center gap-4 text-slate-500 hover:bg-slate-50 p-4 rounded-xl transition-all font-semibold">
                 <i class="fas fa-bolt w-5 text-amber-500"></i> Flux JSON
             </a>
-            <div class="pt-4 mt-4 border-t border-slate-100 space-y-2">
-                <a href="/download_csv" class="flex items-center gap-4 text-emerald-600 hover:bg-emerald-50 p-4 rounded-xl transition-all font-bold border border-emerald-100">
+            <div class="pt-4 mt-4 border-t border-slate-100 space-y-2"
+            >
+             <input type="file" id="fileInput" class="hidden" accept=".xlsx" onchange="handleFileUpload(event)">
+            <button onclick="document.getElementById('fileInput').click()" class="w-full flex items-center gap-4 text-blue-600 hover:bg-blue-50 p-4 rounded-xl transition-all font-bold border border-blue-100">
+           <i class="fas fa-file-import"></i> Import Données
+                </button>
+                          
+                <a href="/export-excel" class="flex items-center gap-4 text-emerald-600 hover:bg-emerald-50 p-4 rounded-xl transition-all font-bold border border-emerald-100">
                     <i class="fas fa-file-csv"></i> Export Données
                 </a>
                 
@@ -758,140 +996,226 @@ def dashboard():
                 <div class="text-2xl font-black text-slate-800"><span id="card-temp">--</span> <small class="text-slate-400 text-sm">°C</small></div>
             </div>
         </div>
-
+            <div id="dropZone" class="glass-card p-6 text-center border-2 border-dashed border-slate-300 text-slate-500 font-semibold">
+    📂 Glissez votre fichier Excel ici ou utilisez "Import Données"
+            </div>
+            <input type="file" id="hiddenFileInput" style="display:none">
         <div id="charts-container" class="space-y-6">
             </div>
     </main>
 
     <script>
-    const commonOptions = (colors, title) => ({
-        chart: { 
-            type: 'line', 
-            height: 300, 
-            toolbar: { show: false }, 
-            animations: { enabled: true },
-            background: '#fff'
-        },
-        series: [], // 🔥 IMPORTANT
-        colors: Array.isArray(colors) ? colors : [colors],
-        stroke: { width: 3, curve: 'smooth' },
-        grid: { 
-            borderColor: '#f1f5f9', 
-            xaxis: { lines: { show: true } }, 
-            yaxis: { lines: { show: true } } 
-        },
-        xaxis: { 
-            type: 'datetime',
-            labels: { 
-                datetimeUTC: false,
-                format: 'HH:mm:ss',
-                style: { colors: '#64748b', fontSize: '10px' } 
-            },
-            title: { text: 'Temps', style: { color: '#94a3b8' } },
-            axisBorder: { show: false }
-        },
-        yaxis: { 
-            labels: { style: { colors: '#64748b' } },
-            title: { text: title, style: { color: '#94a3b8' } }
-        },
-        tooltip: { x: { format: 'dd MMM yyyy HH:mm:ss' } },
-        noData: {
-            text: "Chargement..."
-        }
-    });
+    
+    console.log("Dashboard JS chargé");
 
-    const chartConfigs = [
-        { id: 'altitude', color: '#3b82f6', label: 'Altitude (m)', multi: false },
-        { id: 'vitesse', color: '#f43f5e', label: 'Vitesse (m/s)', multi: false },
-        { id: 'pression', color: '#6366f1', label: 'Pression (hPa)', multi: false },
-        { id: 'temperature', color: '#f59e0b', label: 'Température (°C)', multi: false },
-        { id: 'batterie', color: '#10b981', label: 'Batterie (%)', multi: false },
-        { id: 'accel', color: ['#3b82f6', '#f43f5e', '#10b981'], label: 'Accélération (AX, AY, AZ)', multi: true, keys: ['ax', 'ay', 'az'] },
-        { id: 'attitude', color: ['#8b5cf6', '#ec4899'], label: 'Attitude (Roll, Pitch)', multi: true, keys: ['roll', 'pitch'] },
-        { id: 'yaw', color: '#475569', label: 'Yaw (Cap °)', multi: false }
-    ];
+// ==========================
+// 📊 CHARTS CONFIG
+// ==========================
+const commonOptions = (colors, title) => ({
+    chart: {
+        type: 'line',
+        height: 300,
+        toolbar: { show: false },
+        animations: { enabled: true }
+    },
+    series: [],
+    colors: Array.isArray(colors) ? colors : [colors],
+    stroke: { width: 3, curve: 'smooth' },
+    xaxis: {
+        type: 'datetime'
+    },
+    yaxis: {
+        title: { text: title }
+    },
+    noData: { text: "Chargement..." }
+});
 
-    const charts = {};
-    const container = document.getElementById('charts-container');
+const chartConfigs = [
+    { id: 'altitude', color: '#3b82f6', label: 'Altitude', multi: false },
+    { id: 'vitesse', color: '#f43f5e', label: 'Vitesse', multi: false },
+    { id: 'pression', color: '#6366f1', label: 'Pression', multi: false },
+    { id: 'temperature', color: '#f59e0b', label: 'Température', multi: false },
+    { id: 'batterie', color: '#10b981', label: 'Batterie', multi: false },
+    { id: 'accel', color: ['#3b82f6','#f43f5e','#10b981'], label: 'Accélération', multi: true, keys: ['ax','ay','az'] },
+    { id: 'attitude', color: ['#8b5cf6','#ec4899'], label: 'Attitude', multi: true, keys: ['roll','pitch'] },
+    { id: 'yaw', color: '#475569', label: 'Yaw', multi: false }
+];
 
+const charts = {};
+
+// ==========================
+// 📦 INIT CHARTS
+// ==========================
+const container = document.getElementById("charts-container");
+
+chartConfigs.forEach(conf => {
+    const div = document.createElement("div");
+    div.className = "glass-card p-6";
+    div.innerHTML = `<h3 class="font-bold mb-3">${conf.label}</h3><div id="chart-${conf.id}"></div>`;
+    container.appendChild(div);
+
+    charts[conf.id] = new ApexCharts(
+        document.querySelector(`#chart-${conf.id}`),
+        commonOptions(conf.color, conf.label)
+    );
+
+    charts[conf.id].render();
+});
+
+// ==========================
+// 🔌 WEBSOCKET UNIQUE
+// ==========================
+const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+const socket = new WebSocket(`${wsProtocol}://${window.location.host}/ws`);
+
+socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    // 🟢 CARTES
+    document.getElementById("card-alt").innerText = data.altitude ?? "--";
+    document.getElementById("card-vit").innerText = data.vitesse ?? "--";
+    document.getElementById("card-batt").innerText = data.batterie ?? "--";
+    document.getElementById("card-temp").innerText = data.temperature ?? "--";
+
+    const point = (key) => ({
+    x: Number(data.timestamp) * 1000,
+    y: Number(data[key])
+});
+
+    // 📈 UPDATE GRAPHS LIVE
     chartConfigs.forEach(conf => {
-        const div = document.createElement('div');
-        div.className = "glass-card p-6";
+        if (conf.multi) {
+            charts[conf.id].appendData(
+                conf.keys.map(k => ({ data: [point(k)] }))
+            );
+        } else {
+            charts[conf.id].appendData([
+                { data: [point(conf.id)] }
+            ]);
+        }
+    });
+};
 
-        div.innerHTML = `<h3 class="text-sm font-bold text-slate-700 mb-4 uppercase flex items-center gap-2">
-            <span class="w-1 h-4 rounded" style="background:${Array.isArray(conf.color) ? conf.color[0] : conf.color}"></span> ${conf.label}
-        </h3><div id="chart-${conf.id}"></div>`;
+socket.onerror = (err) => {
+    console.error("WebSocket error:", err);
+};
 
-        container.appendChild(div);
+// ==========================
+// 🔄 REFRESH INITIAL (OPTIONNEL)
+// ==========================
+async function refresh() {
+    try {
+        const res = await fetch("/graph-data");
+        const data = await res.json();
 
-        // 🔥 INIT AVEC SERIES VIDE
-        charts[conf.id] = new ApexCharts(
-            document.querySelector(`#chart-${conf.id}`),
-            commonOptions(conf.color, conf.label)
-        );
+        const mapData = (key) =>
+            data.map(d => ({
+                x: Number(d.timestamp) * 1000,
+                y: Number(d[key])
+            }));
 
-        charts[conf.id].render();
+        chartConfigs.forEach(conf => {
+            if (conf.multi) {
+                charts[conf.id].updateSeries(
+                    conf.keys.map(k => ({
+                        name: k,
+                        data: mapData(k)
+                    }))
+                );
+            } else {
+                charts[conf.id].updateSeries([{
+                    data: mapData(conf.id)
+                }]);
+            }
+        });
+
+    } catch (e) {
+        console.error("refresh error:", e);
+    }
+}
+
+// ==========================
+// 🚀 START
+// ==========================
+window.onload = () => {
+    refresh(); // chargement initial seulement
+};
+
+// ==========================
+// ==========================
+// 📂 UPLOAD EXCEL FUNCTION
+// ==========================
+
+async function handleFileUpload(file) {
+    if (!file) return;
+
+    if (!file.name.endsWith(".xlsx")) {
+        alert("❌ Format invalide. Veuillez envoyer un fichier .xlsx");
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+        const res = await fetch("/upload-excel", {
+            method: "POST",
+            body: formData
+        });
+
+        if (!res.ok) throw new Error("Upload failed");
+
+        const result = await res.json();
+
+        if (result.status === "ok") {
+            alert(`✅ Import réussi : ${result.data.length} lignes`);
+
+            if (typeof refresh === "function") {
+                refresh();
+            }
+        } else {
+            alert(result.error || "Erreur import Excel");
+        }
+
+    } catch (err) {
+        console.error(err);
+        alert("🚨 Erreur upload fichier");
+    }
+}
+
+// ==========================
+// ==========================
+// 📦 DRAG & DROP
+// ==========================
+
+const dropZone = document.getElementById("dropZone");
+
+if (dropZone) {
+
+    dropZone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropZone.classList.add("dragover");
     });
 
-    async function refresh() {
-        try {
-            const response = await fetch('/graph-data');
-            const data = await response.json();
+    dropZone.addEventListener("dragleave", () => {
+        dropZone.classList.remove("dragover");
+    });
 
-            if (!Array.isArray(data) || data.length === 0) return;
+    dropZone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropZone.classList.remove("dragover");
 
-            const last = data[data.length - 1];
+        const file = e.dataTransfer.files?.[0];
 
-            document.getElementById('card-alt').innerText = last.altitude ?? "--";
-            document.getElementById('card-vit').innerText = last.vitesse ?? "--";
-            document.getElementById('card-batt').innerText = last.batterie ?? "--";
-            document.getElementById('card-temp').innerText = last.temperature ?? "--";
-
-            // 🔥 sécurisation des données
-            const mapData = (key) => data
-                .filter(d => d.timestamp && !isNaN(d[key]))
-                .map(d => ({
-                    x: Number(d.timestamp) * 1000,
-                    y: Number(d[key])
-                }));
-
-            chartConfigs.forEach(conf => {
-                if (conf.multi) {
-                    const series = conf.keys.map(k => ({
-                        name: k.toUpperCase(),
-                        data: mapData(k)
-                    }));
-                    charts[conf.id].updateSeries(series, true);
-                } else {
-                    charts[conf.id].updateSeries([{
-                        name: conf.id,
-                        data: mapData(conf.id)
-                    }], true);
-                }
-            });
-
-        } catch (e) {
-            console.error("Erreur refresh:", e);
+        if (!file) {
+            alert("❌ Aucun fichier détecté");
+            return;
         }
-    }
 
-    async function confirmDelete() {
-        if (confirm("⚠️ Êtes-vous sûr de vouloir supprimer TOUTES les données ?")) {
-            try {
-                const res = await fetch('/delete-all', { method: 'DELETE' });
-                if (res.ok) {
-                    alert("Données supprimées.");
-                    window.location.reload();
-                }
-            } catch (e) {
-                alert("Erreur.");
-            }
-        }
-    }
+        handleFileUpload(file);
+    });
+}
 
-    //  refresh immédiat + interval
-    refresh();
-    setInterval(refresh, 800);
 </script>
 </body>
 </html>
